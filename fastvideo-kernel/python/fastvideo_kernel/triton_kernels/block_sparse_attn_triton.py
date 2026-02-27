@@ -16,20 +16,39 @@ import triton.language as tl
 import math  # small utility needed by the sparse wrapper
 # ──────────────────────────── SPARSE ADDITION END ─────────────────────────────
 
-# We don't run auto-tuning every time to keep the tutorial fast. Keeping
-# the code below and commenting out the equivalent parameters is convenient for
-# re-tuning.
-configs = [
-    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [64]\
-    for BN in [64]\
-    for s in [3, 4, 7]\
-    for w in [4, 8]\
-]
+# Detect ROCm (AMD) vs CUDA (NVIDIA) - AMD optimizations apply only on ROCm
+_IS_ROCm = bool(getattr(torch.version, "hip", None))
+
+# Forward autotune configs
+if _IS_ROCm:
+    # AMD ROCm optimizations (vsa_ck_readme.md, MI300X):
+    # - num_stages=1 for Flash Attention-like kernels with 2 fused GEMMs
+    # - matrix_instr_nonkdim=16 for mfma_16x16 (outperforms mfma_32x32 on MI300X)
+    # - waves_per_eu hint for VGPR/occupancy
+    configs_fwd = [
+        triton.Config(
+            {'BLOCK_M': 64, 'BLOCK_N': 64,
+             'matrix_instr_nonkdim': 16, 'waves_per_eu': wpe},
+            num_stages=s,
+            num_warps=w,
+        )
+        for s in [1, 2]
+        for w in [4, 8]
+        for wpe in [2, 4]
+    ]
+else:
+    # Original NVIDIA CUDA configs - unchanged for public repo compatibility
+    configs_fwd = [
+        triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+        for BM in [64]\
+        for BN in [64]\
+        for s in [3, 4, 7]\
+        for w in [4, 8]\
+    ]
 
 
 # ──────────────────────────── SPARSE ADDITION BEGIN ───────────────────────────
-@triton.autotune(configs, key=["N_CTX_Q", "HEAD_DIM"])
+@triton.autotune(configs_fwd, key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd_sparse(
         Q,
@@ -65,7 +84,8 @@ def _attn_fwd_sparse(
         HEAD_DIM: tl.constexpr,  #
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        STAGE: tl.constexpr):
+        STAGE: tl.constexpr,
+        USE_AMD_OPT: tl.constexpr):
     """
     64×64 **block-sparse** forward kernel. Back-prop kernels remain dense
     (32×64 and 64×32) – memory footprint unchanged.
@@ -123,7 +143,10 @@ def _attn_fwd_sparse(
     # ----- accumulators -----
     offs_m = q_blk * BLOCK_M + tl.arange(0, BLOCK_M)
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    if USE_AMD_OPT:
+        l_i = tl.full([BLOCK_M], 1.0, tl.float32)
+    else:
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     qk_scale = sm_scale * 1.44269504  # 1/ln2
     q = tl.load(Q_ptr)
@@ -135,7 +158,10 @@ def _attn_fwd_sparse(
         K_ptr = tl.advance(K_base, (0, kv_idx * BLOCK_N))
         V_ptr = tl.advance(V_base, (kv_idx * BLOCK_N, 0))
 
-        k = tl.load(K_ptr)
+        if USE_AMD_OPT:
+            k = tl.load(K_ptr, eviction_policy="evict_first")
+        else:
+            k = tl.load(K_ptr)
         qk = tl.dot(q, k)
         # mask out invalid columns
         mask = tl.arange(0, BLOCK_N) < block_size
@@ -149,7 +175,10 @@ def _attn_fwd_sparse(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_ptr)
+        if USE_AMD_OPT:
+            v = tl.load(V_ptr, eviction_policy="evict_first")
+        else:
+            v = tl.load(V_ptr)
         acc = tl.dot(p.to(tl.bfloat16), v, acc)
         m_i = m_ij
 
@@ -161,6 +190,69 @@ def _attn_fwd_sparse(
 
 
 # ──────────────────────────── SPARSE ADDITION END ─────────────────────────────
+
+
+# Backward autotune configs
+if _IS_ROCm:
+    # AMD ROCm optimizations for backward kernels
+    configs_bwd_dkdv = [
+        triton.Config({
+            'BLOCK_M1': 32, 'BLOCK_N1': 64,
+            'matrix_instr_nonkdim': 16, 'waves_per_eu': wpe,
+            'USE_AMD_OPT': 1,
+        }, num_stages=s, num_warps=w)
+        for s in [1, 2]
+        for w in [4, 8]
+        for wpe in [2, 4]
+    ]
+    configs_bwd_dq = [
+        triton.Config({
+            'BLOCK_M2': 64, 'BLOCK_N2': 32,
+            'matrix_instr_nonkdim': 16, 'waves_per_eu': wpe,
+            'USE_AMD_OPT': 1,
+        }, num_stages=s, num_warps=w)
+        for s in [1, 2]
+        for w in [4, 8]
+        for wpe in [2, 4]
+    ]
+    configs_bwd = [
+        triton.Config({
+            'BLOCK_M1': 32, 'BLOCK_N1': 64,
+            'BLOCK_M2': 64, 'BLOCK_N2': 32,
+            'matrix_instr_nonkdim': 16, 'waves_per_eu': wpe,
+            'USE_AMD_OPT': 1,
+        }, num_stages=s, num_warps=w)
+        for s in [1, 2]
+        for w in [4, 8]
+        for wpe in [2, 4]
+    ]
+else:
+    # Original CUDA: single effective config (no AMD-specific params)
+    configs_bwd_dkdv = [
+        triton.Config({
+            'BLOCK_M1': 32, 'BLOCK_N1': 64,
+            'USE_AMD_OPT': 0,
+        }, num_stages=s, num_warps=w)
+        for s in [3, 4, 7]
+        for w in [4, 8]
+    ]
+    configs_bwd_dq = [
+        triton.Config({
+            'BLOCK_M2': 64, 'BLOCK_N2': 32,
+            'USE_AMD_OPT': 0,
+        }, num_stages=s, num_warps=w)
+        for s in [3, 4, 7]
+        for w in [4, 8]
+    ]
+    configs_bwd = [
+        triton.Config({
+            'BLOCK_M1': 32, 'BLOCK_N1': 64,
+            'BLOCK_M2': 64, 'BLOCK_N2': 32,
+            'USE_AMD_OPT': 0,
+        }, num_stages=s, num_warps=w)
+        for s in [3, 4, 7]
+        for w in [4, 8]
+    ]
 
 
 @triton.jit
@@ -214,7 +306,8 @@ def _attn_bwd_dkdv(
         # Filled in by the wrapper.
     start_n,
         start_m,
-        num_steps):
+        num_steps,
+        USE_AMD_OPT: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -234,31 +327,45 @@ def _attn_bwd_dkdv(
     q_ptr = k2q_index + meta_base * max_q_blks  # ptr to list
     block_size = tl.load(variable_block_sizes + kv_blk)
 
+    if USE_AMD_OPT:
+        mask = tl.arange(0, BLOCK_N1) < block_size
+
     for blk_idx in range(q_blocks * 2):
         block_sparse_offset = (tl.load(q_ptr + blk_idx // 2).to(tl.int32) * 2 +
                                blk_idx % 2) * step_m
-        qT = tl.load(qT_ptrs + block_sparse_offset * stride_tok)
+
+        if USE_AMD_OPT:
+            qT = tl.load(qT_ptrs + block_sparse_offset * stride_tok,
+                         eviction_policy="evict_first")
+        else:
+            qT = tl.load(qT_ptrs + block_sparse_offset * stride_tok)
         # Load m before computing qk to reduce pipeline stall.
-        offs_m = start_m + block_sparse_offset + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
+        offs_m_iter = start_m + block_sparse_offset + tl.arange(0, BLOCK_M1)
+        m = tl.load(M + offs_m_iter)
         qkT = tl.dot(k, qT)
         pT = tl.math.exp2(qkT - m[None, :])
-        mask = tl.arange(0, BLOCK_N1) < block_size
-        pT = tl.where(mask[:, None], pT, 0.0)
+        if USE_AMD_OPT:
+            pT = tl.where(mask[:, None], pT, 0.0)
+        else:
+            mask = tl.arange(0, BLOCK_N1) < block_size
+            pT = tl.where(mask[:, None], pT, 0.0)
 
-        do = tl.load(do_ptrs + block_sparse_offset * stride_tok)
+        if USE_AMD_OPT:
+            do = tl.load(do_ptrs + block_sparse_offset * stride_tok,
+                         eviction_policy="evict_first")
+        else:
+            do = tl.load(do_ptrs + block_sparse_offset * stride_tok)
         # Compute dV.
-        ppT = pT
-        ppT = ppT.to(tl.bfloat16)
+        ppT = pT.to(tl.bfloat16)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
+        Di = tl.load(D + offs_m_iter)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(tl.bfloat16)
         dk += tl.dot(dsT, tl.trans(qT))
-        # Increment pointers.
+
     return dk, dv
 
 
@@ -287,7 +394,8 @@ def _attn_bwd_dq(
         # Filled in by the wrapper.
         start_m,
         start_n,
-        num_steps):
+        num_steps,
+        USE_AMD_OPT: tl.constexpr):
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -317,8 +425,14 @@ def _attn_bwd_dq(
         block_size = tl.load(variable_block_sizes + kv_idx).to(tl.int32)
         half = (blk_idx % 2).to(tl.int32)
         block_sparse_offset = (kv_idx * 2 + half) * step_n * stride_tok
-        kT = tl.load(kT_ptrs + block_sparse_offset)
-        vT = tl.load(vT_ptrs + block_sparse_offset)
+        if USE_AMD_OPT:
+            kT = tl.load(kT_ptrs + block_sparse_offset,
+                         eviction_policy="evict_first")
+            vT = tl.load(vT_ptrs + block_sparse_offset,
+                         eviction_policy="evict_first")
+        else:
+            kT = tl.load(kT_ptrs + block_sparse_offset)
+            vT = tl.load(vT_ptrs + block_sparse_offset)
         qk = tl.dot(q, kT)
         p = tl.math.exp2(qk - m)
         offs_in_block = half * step_n + tl.arange(0, BLOCK_N2)
@@ -335,6 +449,7 @@ def _attn_bwd_dq(
     return dq
 
 
+@triton.autotune(configs_bwd, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd(
         Q,
@@ -365,7 +480,8 @@ def _attn_bwd(
         BLOCK_N1: tl.constexpr,  #
         BLOCK_M2: tl.constexpr,  #
         BLOCK_N2: tl.constexpr,  #
-        HEAD_DIM: tl.constexpr):
+        HEAD_DIM: tl.constexpr,
+        USE_AMD_OPT: tl.constexpr):
     LN2 = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
@@ -424,7 +540,8 @@ def _attn_bwd(
         HEAD_DIM,  #
         start_n,
         start_m,
-        num_steps  #
+        num_steps,
+        USE_AMD_OPT,
     )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -470,7 +587,8 @@ def _attn_bwd(
         HEAD_DIM,  #
         start_m,
         end_n,
-        num_steps  #
+        num_steps,
+        USE_AMD_OPT,
     )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -478,6 +596,7 @@ def _attn_bwd(
     tl.store(dq_ptrs, dq)
 
 
+@triton.autotune(configs_bwd_dkdv, key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_dkdv_kernel(
         Q,
@@ -514,7 +633,8 @@ def _attn_bwd_dkdv_kernel(
         N_CTX_KV,
         BLOCK_M1: tl.constexpr,  #
         BLOCK_N1: tl.constexpr,  #
-        HEAD_DIM: tl.constexpr):
+        HEAD_DIM: tl.constexpr,
+        USE_AMD_OPT: tl.constexpr):
     """
     Backward kernel that computes dK and dV for each KV block (64 tokens).
     Grid:
@@ -580,6 +700,7 @@ def _attn_bwd_dkdv_kernel(
         start_n=start_n,
         start_m=0,
         num_steps=num_steps,
+        USE_AMD_OPT=USE_AMD_OPT,
     )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -590,6 +711,7 @@ def _attn_bwd_dkdv_kernel(
     tl.store(dk_ptrs, dk_acc)
 
 
+@triton.autotune(configs_bwd_dq, key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_dq_kernel(
         Q,
@@ -621,7 +743,8 @@ def _attn_bwd_dq_kernel(
         N_CTX_Q,
         BLOCK_M2: tl.constexpr,  #
         BLOCK_N2: tl.constexpr,  #
-        HEAD_DIM: tl.constexpr):
+        HEAD_DIM: tl.constexpr,
+        USE_AMD_OPT: tl.constexpr):
     """
     Backward kernel that computes dQ for each Q block (64 tokens).
     Grid:
@@ -681,6 +804,7 @@ def _attn_bwd_dq_kernel(
         start_m=start_m,
         start_n=0,
         num_steps=num_steps,
+        USE_AMD_OPT=USE_AMD_OPT,
     )
 
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -738,7 +862,8 @@ def triton_block_sparse_attn_forward(q, k, v, q2k_index, q2k_num,
                            Tq,
                            Tkv,
                            HEAD_DIM=D,
-                           STAGE=3)
+                           STAGE=3,
+                           USE_AMD_OPT=_IS_ROCm)
 
     return o, M
 
@@ -754,7 +879,6 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num,
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     BATCH, N_HEAD = q.shape[:2]
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
     RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
     arg_k = k
     arg_k = arg_k * (sm_scale * RCP_LN2)
@@ -776,8 +900,10 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num,
     max_q_blks = k2q_index.shape[-1]
     max_kv_blks = q2k_index.shape[-1]
 
+    BLOCK_SIZE = 64
+
     # dK/dV kernel: grid over KV blocks
-    grid_kv = (Tkv // BLOCK_N1, 1, BATCH * N_HEAD)
+    grid_kv = (Tkv // BLOCK_SIZE, 1, BATCH * N_HEAD)
     _attn_bwd_dkdv_kernel[grid_kv](
         q,
         arg_k,
@@ -809,13 +935,11 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num,
         N_HEAD,
         Tq,
         Tkv,
-        BLOCK_M1=BLOCK_M1,
-        BLOCK_N1=BLOCK_N1,
         HEAD_DIM=D,
     )
 
     # dQ kernel: grid over Q blocks
-    grid_q = (Tq // BLOCK_M2, 1, BATCH * N_HEAD)
+    grid_q = (Tq // BLOCK_SIZE, 1, BATCH * N_HEAD)
     _attn_bwd_dq_kernel[grid_q](
         q,
         arg_k,
@@ -842,8 +966,6 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num,
         dq.stride(1),
         N_HEAD,
         Tq,
-        BLOCK_M2=BLOCK_M2,
-        BLOCK_N2=BLOCK_N2,
         HEAD_DIM=D,
     )
 
