@@ -27,6 +27,11 @@ image = (
         "curl",
         "libssl-dev",
         "ffmpeg",
+        "libgl1",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+        "libxrender1",
     )
     .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable")
     .run_commands("echo 'source ~/.cargo/env' >> ~/.bashrc")
@@ -455,20 +460,31 @@ def _prepare_ssim_workspace(
     set -euo pipefail
     source $HOME/.local/bin/env
     source /opt/venv/bin/activate
+    git_retry() {{
+      local attempt
+      for attempt in 1 2 3; do
+        if "$@"; then return 0; fi
+        echo "git command failed (attempt $attempt/3), retrying in 5s..."
+        sleep 5
+      done
+      "$@"
+    }}
     if [ -d {shlex.quote(repo_root)}/.git ]; then
       cd {shlex.quote(repo_root)}
       git remote set-url origin {shlex.quote(git_repo)} || true
-      git fetch --prune origin
+      git_retry git fetch --prune origin
     else
-      git clone {shlex.quote(git_repo)} {shlex.quote(repo_root)}
+      git_retry git clone {shlex.quote(git_repo)} {shlex.quote(repo_root)}
       cd {shlex.quote(repo_root)}
     fi
     {checkout_command}
-    git submodule update --init --recursive
+    rm -rf fastvideo/tests/ssim/reference_videos
+    git_retry git submodule update --init --recursive
     cd fastvideo-kernel
     ./build.sh
     cd ..
     uv pip install -e .[test]
+    uv pip install git+https://github.com/microsoft/MoGe.git
     export HF_HOME='/root/data/.cache'
     hf auth login --token "$HF_API_KEY"
     """
